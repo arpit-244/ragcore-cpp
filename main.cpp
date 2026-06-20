@@ -1,16 +1,23 @@
 #include <iostream>
 #include <vector>
 #include <string>
-#include <cmath>
-#include <functional>
-#include <iomanip>
 #include <algorithm>
+#include <cmath>
+#include <random>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
 #include <queue>
+#include <set>
+#include <sstream>
+#include <iomanip>
+#include <functional>
+#include <fstream>
+#include <climits>
 
-// Set to 4 for this basic math test so we don't have to type 16 numbers
+
 static const int DIMS = 4; 
 
-// Represents a single stored document and its numerical embedding
 struct VectorItem {
     int id;
     std::string metadata;
@@ -21,7 +28,7 @@ struct VectorItem {
 // Blueprint for distance metric functions
 using DistFn = std::function<float(const std::vector<float>&, const std::vector<float>&)>;
 
-// Straight-line distance (Pythagorean)
+
 float euclidean(const std::vector<float>& a, const std::vector<float>& b) {
     float s = 0;
     for (int i = 0; i < (int)a.size(); i++) { 
@@ -31,7 +38,7 @@ float euclidean(const std::vector<float>& a, const std::vector<float>& b) {
     return std::sqrt(s);
 }
 
-// Angular distance (Standard for AI text embeddings)
+
 float cosine(const std::vector<float>& a, const std::vector<float>& b) {
     float dot = 0, na = 0, nb = 0;
     for (int i = 0; i < (int)a.size(); i++) {
@@ -43,7 +50,6 @@ float cosine(const std::vector<float>& a, const std::vector<float>& b) {
     return 1.0f - dot / (std::sqrt(na) * std::sqrt(nb));
 }
 
-// Grid-based distance
 float manhattan(const std::vector<float>& a, const std::vector<float>& b) {
     float s = 0;
     for (int i = 0; i < (int)a.size(); i++) {
@@ -168,42 +174,235 @@ public:
         std::sort(r.begin(), r.end());
         return r;
     }
+    void rebuild(const std::vector<VectorItem>& items) {
+        destroy(root); root = nullptr;
+        for (auto& v : items) insert(v);
+    }
+};
+
+class HNSW {
+    struct Node {
+        VectorItem item;
+        int maxLyr;
+        std::vector<std::vector<int>> nbrs;
+    };
+
+    std::unordered_map<int, Node> G;
+    int    M, M0, ef_build;
+    float  mL;
+    int    topLayer = -1;
+    int    entryPt  = -1;
+    std::mt19937 rng;
+
+    int randLevel() {
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        return (int)std::floor(-std::log(u(rng)) * mL);
+    }
+
+    std::vector<std::pair<float,int>> searchLayer(
+        const std::vector<float>& q, int ep, int ef, int lyr, DistFn dist)
+    {
+        std::unordered_map<int,bool> vis;
+        std::priority_queue<std::pair<float,int>,
+            std::vector<std::pair<float,int>>, std::greater<>> cands;
+        std::priority_queue<std::pair<float,int>> found;
+
+        float d0 = dist(q, G[ep].item.emb);
+        vis[ep] = true;
+        cands.push({d0, ep});
+        found.push({d0, ep});
+
+        while (!cands.empty()) {
+            auto [cd, cid] = cands.top(); cands.pop();
+            if ((int)found.size() >= ef && cd > found.top().first) break;
+            if (lyr >= (int)G[cid].nbrs.size()) continue;
+            for (int nid : G[cid].nbrs[lyr]) {
+                if (vis[nid] || !G.count(nid)) continue;
+                vis[nid] = true;
+                float nd = dist(q, G[nid].item.emb);
+                if ((int)found.size() < ef || nd < found.top().first) {
+                    cands.push({nd, nid});
+                    found.push({nd, nid});
+                    if ((int)found.size() > ef) found.pop();
+                }
+            }
+        }
+
+        std::vector<std::pair<float,int>> res;
+        while (!found.empty()) { res.push_back(found.top()); found.pop(); }
+        std::sort(res.begin(), res.end());
+        return res;
+    }
+
+    std::vector<int> selectNbrs(std::vector<std::pair<float,int>>& cands, int maxM) {
+        std::vector<int> r;
+        for (int i = 0; i < std::min((int)cands.size(), maxM); i++)
+            r.push_back(cands[i].second);
+        return r;
+    }
+
+public:
+    HNSW(int m = 16, int efBuild = 200)
+        : M(m), M0(2*m), ef_build(efBuild),
+          mL(1.0f / std::log((float)m)), rng(42) {}
+
+    void insert(const VectorItem& item, DistFn dist) {
+        int id  = item.id;
+        int lvl = randLevel();
+        G[id]   = {item, lvl, std::vector<std::vector<int>>(lvl + 1)};
+
+        if (entryPt == -1) { entryPt = id; topLayer = lvl; return; }
+
+        int ep = entryPt;
+        for (int lc = topLayer; lc > lvl; lc--) {
+            if (lc < (int)G[ep].nbrs.size()) {
+                auto W = searchLayer(item.emb, ep, 1, lc, dist);
+                if (!W.empty()) ep = W[0].second;
+            }
+        }
+        for (int lc = std::min(topLayer, lvl); lc >= 0; lc--) {
+            auto W   = searchLayer(item.emb, ep, ef_build, lc, dist);
+            int maxM = (lc == 0) ? M0 : M;
+            auto sel = selectNbrs(W, maxM);
+            G[id].nbrs[lc] = sel;
+
+            for (int nid : sel) {
+                if (!G.count(nid)) continue;
+                if ((int)G[nid].nbrs.size() <= lc) G[nid].nbrs.resize(lc + 1);
+                auto& conn = G[nid].nbrs[lc];
+                conn.push_back(id);
+                if ((int)conn.size() > maxM) {
+                    std::vector<std::pair<float,int>> ds;
+                    for (int c : conn) if (G.count(c))
+                        ds.push_back({dist(G[nid].item.emb, G[c].item.emb), c});
+                    std::sort(ds.begin(), ds.end());
+                    conn.clear();
+                    for (int i = 0; i < maxM && i < (int)ds.size(); i++)
+                        conn.push_back(ds[i].second);
+                }
+            }
+            if (!W.empty()) ep = W[0].second;
+        }
+        if (lvl > topLayer) { topLayer = lvl; entryPt = id; }
+    }
+
+    std::vector<std::pair<float,int>> knn(
+        const std::vector<float>& q, int k, int ef, DistFn dist)
+    {
+        if (entryPt == -1) return {};
+        int ep = entryPt;
+        for (int lc = topLayer; lc > 0; lc--) {
+            if (lc < (int)G[ep].nbrs.size()) {
+                auto W = searchLayer(q, ep, 1, lc, dist);
+                if (!W.empty()) ep = W[0].second;
+            }
+        }
+        auto W = searchLayer(q, ep, std::max(ef, k), 0, dist);
+        if ((int)W.size() > k) W.resize(k);
+        return W;
+    }
+
+    void remove(int id) {
+        if (!G.count(id)) return;
+        for (auto& [nid, nd] : G)
+            for (auto& layer : nd.nbrs)
+                layer.erase(std::remove(layer.begin(), layer.end(), id), layer.end());
+        if (entryPt == id) {
+            entryPt = -1;
+            for (auto& [nid, nd] : G) if (nid != id) { entryPt = nid; break; }
+        }
+        G.erase(id);
+    }
+
+    struct GraphInfo {
+        int topLayer, nodeCount;
+        std::vector<int> nodesPerLayer, edgesPerLayer;
+        struct NV { int id; std::string metadata, category; int maxLyr; };
+        struct EV { int src, dst, lyr; };
+        std::vector<NV> nodes;
+        std::vector<EV> edges;
+    };
+
+    GraphInfo getInfo() {
+        GraphInfo gi;
+        gi.topLayer  = topLayer;
+        gi.nodeCount = (int)G.size();
+        int maxL = std::max(topLayer + 1, 1);
+        gi.nodesPerLayer.assign(maxL, 0);
+        gi.edgesPerLayer.assign(maxL, 0);
+        for (auto& [id, nd] : G) {
+            gi.nodes.push_back({id, nd.item.metadata, nd.item.category, nd.maxLyr});
+            for (int lc = 0; lc <= nd.maxLyr && lc < maxL; lc++) {
+                gi.nodesPerLayer[lc]++;
+                if (lc < (int)nd.nbrs.size())
+                    for (int nid : nd.nbrs[lc])
+                        if (id < nid) {
+                            gi.edgesPerLayer[lc]++;
+                            gi.edges.push_back({id, nid, lc});
+                        }
+            }
+        }
+        return gi;
+    }
+
+    size_t size() const { return G.size(); }
 };
 
 int main() {
-    std::cout << "=== Vector Database: Search Test ===" << std::endl;
+    std::cout << "Booting up VectorDB engine tests...\n\n";
 
+    
     BruteForce bf;
     KDTree kdt(DIMS);
-    DistFn dist = getDistFn("cosine");
-
-    // Load some mock data
-    VectorItem itemA = {1, "Machine Learning", "Tech", {0.9f, 0.8f, 0.1f, 0.2f}};
-    VectorItem itemB = {2, "Artificial Intelligence", "Tech", {0.8f, 0.9f, 0.2f, 0.1f}};
-    VectorItem itemC = {3, "Cooking Pasta", "Food", {0.1f, 0.0f, 0.9f, 0.8f}};
-    VectorItem itemD = {4, "Baking Bread", "Food", {0.0f, 0.1f, 0.8f, 0.9f}};
-
-    bf.insert(itemA); kdt.insert(itemA);
-    bf.insert(itemB); kdt.insert(itemB);
-    bf.insert(itemC); kdt.insert(itemC);
-    bf.insert(itemD); kdt.insert(itemD);
-
-    // Create a query asking about food
-    std::vector<float> query = {0.0f, 0.0f, 1.0f, 1.0f}; 
-
-    std::cout << "\nSearching for 'Food' related concepts (K=2):\n";
+    HNSW hnsw(16, 200); // M=16, ef_build=200
     
-    auto bf_results = bf.knn(query, 2, dist);
-    std::cout << "\nBrute Force Results:\n";
-    for(auto& hit : bf_results) {
-        std::cout << "Found ID: " << hit.second << " (Distance: " << hit.first << ")\n";
+    auto cosineDist = getDistFn("cosine");
+
+    std::vector<VectorItem> docs = {
+        {1, "Machine Learning", "Tech", {0.9f, 0.8f, 0.1f, 0.2f}},
+        {2, "Artificial Intelligence", "Tech", {0.8f, 0.9f, 0.2f, 0.1f}},
+        {3, "Data Science", "Tech", {0.85f, 0.85f, 0.15f, 0.15f}},
+        {4, "Cooking Pasta", "Food", {0.1f, 0.0f, 0.9f, 0.8f}},
+        {5, "Baking Bread", "Food", {0.0f, 0.1f, 0.8f, 0.9f}},
+        {6, "Grilling Steak", "Food", {0.2f, 0.1f, 0.85f, 0.85f}}
+    };
+
+    std::cout << "Indexing " << docs.size() << " documents...\n";
+    for (const auto& doc : docs) {
+        bf.insert(doc);
+        kdt.insert(doc);
+        hnsw.insert(doc, cosineDist);
     }
 
-    auto kd_results = kdt.knn(query, 2, dist);
-    std::cout << "\nKD-Tree Results:\n";
-    for(auto& hit : kd_results) {
-         std::cout << "Found ID: " << hit.second << " (Distance: " << hit.first << ")\n";
+    
+    auto info = hnsw.getInfo();
+    std::cout << "HNSW built successfully. Top layer reached: " << info.topLayer << "\n\n";
+
+    
+    std::vector<float> query = {0.0f, 0.0f, 1.0f, 1.0f}; 
+    int k = 2; 
+
+    std::cout << "Searching for 'Food' (K=" << k << ")...\n\n";
+    
+    
+    std::cout << "[Brute Force Baseline]\n";
+    for(auto& hit : bf.knn(query, k, cosineDist)) {
+        std::cout << "  -> Doc ID: " << hit.second << " (dist: " << hit.first << ")\n";
     }
+
+    
+    std::cout << "\n[KD-Tree]\n";
+    for(auto& hit : kdt.knn(query, k, cosineDist)) {
+         std::cout << "  -> Doc ID: " << hit.second << " (dist: " << hit.first << ")\n";
+    }
+
+    
+    std::cout << "\n[HNSW (ef=50)]\n";
+    for(auto& hit : hnsw.knn(query, k, 50, cosineDist)) {
+         std::cout << "  -> Doc ID: " << hit.second << " (dist: " << hit.first << ")\n";
+    }
+
+    std::cout << "\nDone. If HNSW matches Brute Force, the graph routing works perfectly!\n";
 
     return 0;
 }
