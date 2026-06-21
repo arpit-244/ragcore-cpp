@@ -90,6 +90,10 @@ public:
         if ((int)r.size() > k) r.resize(k);
         return r;
     }
+    void remove(int id) {
+        items.erase(std::remove_if(items.begin(), items.end(),
+            [id](const VectorItem& v){ return v.id == id; }), items.end());
+    }
 };
 
 
@@ -348,61 +352,117 @@ public:
     size_t size() const { return G.size(); }
 };
 
-int main() {
-    std::cout << "Booting up VectorDB engine tests...\n\n";
+// vectorDB
 
-    
+class VectorDB {
+    std::unordered_map<int, VectorItem> store;
     BruteForce bf;
-    KDTree kdt(DIMS);
-    HNSW hnsw(16, 200); // M=16, ef_build=200
-    
-    auto cosineDist = getDistFn("cosine");
+    KDTree     kdt;
+    HNSW       hnsw;
+    std::mutex mu;
+    int nextId = 1;
 
-    std::vector<VectorItem> docs = {
-        {1, "Machine Learning", "Tech", {0.9f, 0.8f, 0.1f, 0.2f}},
-        {2, "Artificial Intelligence", "Tech", {0.8f, 0.9f, 0.2f, 0.1f}},
-        {3, "Data Science", "Tech", {0.85f, 0.85f, 0.15f, 0.15f}},
-        {4, "Cooking Pasta", "Food", {0.1f, 0.0f, 0.9f, 0.8f}},
-        {5, "Baking Bread", "Food", {0.0f, 0.1f, 0.8f, 0.9f}},
-        {6, "Grilling Steak", "Food", {0.2f, 0.1f, 0.85f, 0.85f}}
-    };
+public:
+    const int dims;
+    explicit VectorDB(int d) : kdt(d), hnsw(16, 200), dims(d) {}
 
-    std::cout << "Indexing " << docs.size() << " documents...\n";
-    for (const auto& doc : docs) {
-        bf.insert(doc);
-        kdt.insert(doc);
-        hnsw.insert(doc, cosineDist);
+    int insert(const std::string& meta, const std::string& cat,
+               const std::vector<float>& emb, DistFn dist)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        VectorItem v{nextId++, meta, cat, emb};
+        store[v.id] = v;
+        bf.insert(v); kdt.insert(v); hnsw.insert(v, dist);
+        return v.id;
     }
 
-    
-    auto info = hnsw.getInfo();
-    std::cout << "HNSW built successfully. Top layer reached: " << info.topLayer << "\n\n";
-
-    
-    std::vector<float> query = {0.0f, 0.0f, 1.0f, 1.0f}; 
-    int k = 2; 
-
-    std::cout << "Searching for 'Food' (K=" << k << ")...\n\n";
-    
-    
-    std::cout << "[Brute Force Baseline]\n";
-    for(auto& hit : bf.knn(query, k, cosineDist)) {
-        std::cout << "  -> Doc ID: " << hit.second << " (dist: " << hit.first << ")\n";
+    bool remove(int id) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!store.count(id)) return false;
+        store.erase(id); bf.remove(id); hnsw.remove(id);
+        std::vector<VectorItem> rem;
+        for (auto& [i, v] : store) rem.push_back(v);
+        kdt.rebuild(rem);
+        return true;
     }
 
-    
-    std::cout << "\n[KD-Tree]\n";
-    for(auto& hit : kdt.knn(query, k, cosineDist)) {
-         std::cout << "  -> Doc ID: " << hit.second << " (dist: " << hit.first << ")\n";
+    struct Hit { int id; std::string meta, cat; std::vector<float> emb; float dist; };
+    struct SearchOut { std::vector<Hit> hits; long long us; std::string algo, metric; };
+
+    SearchOut search(const std::vector<float>& q, int k,
+                     const std::string& metric, const std::string& algo)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        auto dfn = getDistFn(metric);
+        auto t0  = std::chrono::high_resolution_clock::now();
+
+        std::vector<std::pair<float,int>> raw;
+        if      (algo == "bruteforce") raw = bf.knn(q, k, dfn);
+        else if (algo == "kdtree")     raw = kdt.knn(q, k, dfn);
+        else                           raw = hnsw.knn(q, k, 50, dfn);
+
+        long long us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+
+        SearchOut out; out.us = us; out.algo = algo; out.metric = metric;
+        for (auto& [d, id] : raw)
+            if (store.count(id))
+                out.hits.push_back({id, store[id].metadata, store[id].category, store[id].emb, d});
+        return out;
     }
 
-    
-    std::cout << "\n[HNSW (ef=50)]\n";
-    for(auto& hit : hnsw.knn(query, k, 50, cosineDist)) {
-         std::cout << "  -> Doc ID: " << hit.second << " (dist: " << hit.first << ")\n";
-    }
+    struct BenchOut { long long bfUs, kdUs, hnswUs; int n; };
 
-    std::cout << "\nDone. If HNSW matches Brute Force, the graph routing works perfectly!\n";
+    BenchOut benchmark(const std::vector<float>& q, int k, const std::string& metric) {
+        std::lock_guard<std::mutex> lk(mu);
+        auto dfn  = getDistFn(metric);
+        auto time = [&](auto fn) -> long long {
+            auto t = std::chrono::high_resolution_clock::now();
+            fn();
+            return std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::high_resolution_clock::now() - t).count();
+        };
+        return {
+            time([&]{ bf.knn(q, k, dfn); }),
+            time([&]{ kdt.knn(q, k, dfn); }),
+            time([&]{ hnsw.knn(q, k, 50, dfn); }),
+            (int)store.size()
+        };
+    }
+};
+
+int main() {
+    VectorDB db(4);
+    auto distFn = getDistFn("cosine");
+
+    // Populate database
+    db.insert("Machine Learning Basics", "Tech", {0.9f, 0.8f, 0.1f, 0.2f}, distFn);
+    db.insert("Deep Learning Guide", "Tech", {0.8f, 0.9f, 0.2f, 0.1f}, distFn);
+    db.insert("Advanced NLP Systems", "Tech", {0.85f, 0.85f, 0.15f, 0.15f}, distFn);
+    db.insert("Homemade Pasta Dough", "Food", {0.1f, 0.0f, 0.9f, 0.8f}, distFn);
+    db.insert("Sourdough Bread Art", "Food", {0.0f, 0.1f, 0.8f, 0.9f}, distFn);
+    
+    int delId = db.insert("Wood-Fired Pizza Secrets", "Food", {0.2f, 0.1f, 0.85f, 0.85f}, distFn);
+
+    // Test specific indices
+    std::vector<float> query = {0.0f, 0.0f, 1.0f, 1.0f};
+    int k = 2;
+
+    auto kdtRes = db.search(query, k, "cosine", "kdtree");
+    std::cout << "KD-Tree: " << kdtRes.hits[0].meta << " (" << kdtRes.us << " us)\n";
+
+    auto hnswRes = db.search(query, k, "cosine", "hnsw");
+    std::cout << "HNSW:    " << hnswRes.hits[0].meta << " (" << hnswRes.us << " us)\n";
+
+    // Test cascaded deletion
+    db.remove(delId);
+
+    
+    auto bench = db.benchmark(query, k, "cosine");
+    std::cout << "\n--- Benchmark (N=" << bench.n << ") ---\n";
+    std::cout << "BruteForce: " << bench.bfUs << " us\n";
+    std::cout << "KD-Tree:    " << bench.kdUs << " us\n";
+    std::cout << "HNSW:       " << bench.hnswUs << " us\n";
 
     return 0;
 }
