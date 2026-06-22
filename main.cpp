@@ -14,7 +14,8 @@
 #include <functional>
 #include <fstream>
 #include <climits>
-
+#include "httplib.h"
+ 
 
 static const int DIMS = 4; 
 
@@ -431,38 +432,243 @@ public:
     }
 };
 
+//  JSON HELPERS
+
+std::string jS(const std::string& s) {
+
+    std::string o = "\"";
+
+    for (char c : s) {
+
+        if      (c == '"')  o += "\\\"";
+
+        else if (c == '\\') o += "\\\\";
+
+        else if (c == '\n') o += "\\n";
+
+        else if (c == '\r') o += "\\r";
+
+        else if (c == '\t') o += "\\t";
+
+        else                o += c;
+
+    }
+
+    return o + '"';
+
+}
+
+
+
+std::string jVec(const std::vector<float>& v) {
+
+    std::ostringstream ss; ss << '[';
+
+    for (size_t i = 0; i < v.size(); i++) {
+
+        if (i) ss << ',';
+
+        ss << std::fixed << std::setprecision(4) << v[i];
+
+    }
+
+    return ss.str() + ']';
+}
+
+
+
+std::vector<float> parseVec(const std::string& s) {
+
+    std::vector<float> v;
+    std::istringstream ss(s); std::string t;
+
+    while (std::getline(ss, t, ','))
+
+        try { v.push_back(std::stof(t)); } catch (...) {}
+
+    return v;
+
+}
+
+
+
+// extract a JSON string field value (handles basic escape sequences)
+
+std::string extractStr(const std::string& body, const std::string& key) {
+
+    size_t p = body.find('"' + key + '"');
+
+    if (p == std::string::npos) return "";
+
+    p = body.find(':', p) + 1;
+
+    while (p < body.size() && (body[p] == ' ' || body[p] == '\t')) p++;
+
+    if (p >= body.size() || body[p] != '"') return "";
+
+    p++;
+
+    std::string result;
+
+    while (p < body.size()) {
+
+        if (body[p] == '"') break;
+
+        if (body[p] == '\\' && p + 1 < body.size()) {
+
+            p++;
+
+            switch (body[p]) {
+
+                case '"':  result += '"';  break;
+
+                case '\\': result += '\\'; break;
+
+                case 'n':  result += '\n'; break;
+
+                case 'r':  result += '\r'; break;
+
+                case 't':  result += '\t'; break;
+
+                default:   result += body[p]; break;
+
+            }
+
+        } else {
+
+            result += body[p];
+
+        }
+
+        p++;
+
+    }
+
+    return result;
+
+}
+
+
+
+// Extract a JSON integer field value
+int extractInt(const std::string& body, const std::string& key, int def = 0) {
+
+    size_t p = body.find('"' + key + '"');
+
+    if (p == std::string::npos) return def;
+
+    p = body.find(':', p) + 1;
+
+    while (p < body.size() && (body[p] == ' ' || body[p] == '\t')) p++;
+
+    try { return std::stoi(body.substr(p)); } catch (...) { return def; }
+
+}
+
+
+
+bool parseBody(const std::string& b, std::string& meta,
+
+                std::string& cat, std::vector<float>& emb)
+
+{
+
+    meta = extractStr(b, "metadata");
+
+    cat  = extractStr(b, "category");
+
+    auto extractArr = [&](const std::string& key) -> std::vector<float> {
+
+        size_t p = b.find('"' + key + '"');
+
+        if (p == std::string::npos) return {};
+
+        p = b.find('[', p);
+
+        if (p == std::string::npos) return {};
+
+        size_t e = b.find(']', p);
+
+        if (e == std::string::npos) return {};
+
+        return parseVec(b.substr(p + 1, e - p - 1));
+
+    };
+
+    emb = extractArr("embedding");
+
+    return !meta.empty() && !emb.empty();
+
+}
+
+
+
+void cors(httplib::Response& res) {
+
+    res.set_header("Access-Control-Allow-Origin",  "*");
+
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+
+    res.set_header("Access-Control-Allow-Headers", "Content-Type");
+
+}  
+
 int main() {
-    VectorDB db(4);
+    VectorDB db(4); // Testing with 4d vectors
     auto distFn = getDistFn("cosine");
+    httplib::Server svr;
 
-    // Populate database
-    db.insert("Machine Learning Basics", "Tech", {0.9f, 0.8f, 0.1f, 0.2f}, distFn);
-    db.insert("Deep Learning Guide", "Tech", {0.8f, 0.9f, 0.2f, 0.1f}, distFn);
-    db.insert("Advanced NLP Systems", "Tech", {0.85f, 0.85f, 0.15f, 0.15f}, distFn);
-    db.insert("Homemade Pasta Dough", "Food", {0.1f, 0.0f, 0.9f, 0.8f}, distFn);
-    db.insert("Sourdough Bread Art", "Food", {0.0f, 0.1f, 0.8f, 0.9f}, distFn);
+    // Handle CORS preflight requests for frontend compatibility
+    svr.Options(".*", [](const httplib::Request&, httplib::Response& res) { 
+        cors(res); 
+    });
+
+    svr.Post("/insert", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        std::string meta, cat; 
+        std::vector<float> emb;
+        
+        if (!parseBody(req.body, meta, cat, emb) || emb.size() != db.dims) {
+            res.status = 400;
+            res.set_content("{\"error\":\"Invalid format or dimension mismatch\"}", "application/json");
+            return;
+        }
+        
+        int id = db.insert(meta, cat, emb, distFn);
+        res.set_content("{\"id\":" + std::to_string(id) + "}", "application/json");
+    });
+
+    svr.Post("/search", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        int k = extractInt(req.body, "k", 2);
+        std::string algo = extractStr(req.body, "algo");
+        if (algo.empty()) algo = "hnsw";
+
+        // Extract the query array manually using string positions
+        size_t p = req.body.find("\"query\"");
+        p = req.body.find('[', p);
+        size_t e = req.body.find(']', p);
+        std::vector<float> q = parseVec(req.body.substr(p + 1, e - p - 1));
+
+        auto out = db.search(q, k, "cosine", algo);
+
+        // Manually build the JSON response
+        std::string json = "{\"time_us\":" + std::to_string(out.us) + ",\"algo\":" + jS(out.algo) + ",\"hits\":[";
+        for (size_t i = 0; i < out.hits.size(); i++) {
+            if (i > 0) json += ",";
+            json += "{\"id\":" + std::to_string(out.hits[i].id) + 
+                    ",\"meta\":" + jS(out.hits[i].meta) + 
+                    ",\"cat\":" + jS(out.hits[i].cat) + 
+                    ",\"dist\":" + std::to_string(out.hits[i].dist) + "}";
+        }
+        json += "]}";
+        
+        res.set_content(json, "application/json");
+    });
+
+    std::cout << "VectorDB Server booting up...\n";
+    std::cout << "Listening on http://localhost:8080\n";
     
-    int delId = db.insert("Wood-Fired Pizza Secrets", "Food", {0.2f, 0.1f, 0.85f, 0.85f}, distFn);
-
-    // Test specific indices
-    std::vector<float> query = {0.0f, 0.0f, 1.0f, 1.0f};
-    int k = 2;
-
-    auto kdtRes = db.search(query, k, "cosine", "kdtree");
-    std::cout << "KD-Tree: " << kdtRes.hits[0].meta << " (" << kdtRes.us << " us)\n";
-
-    auto hnswRes = db.search(query, k, "cosine", "hnsw");
-    std::cout << "HNSW:    " << hnswRes.hits[0].meta << " (" << hnswRes.us << " us)\n";
-
-    // Test cascaded deletion
-    db.remove(delId);
-
-    
-    auto bench = db.benchmark(query, k, "cosine");
-    std::cout << "\n--- Benchmark (N=" << bench.n << ") ---\n";
-    std::cout << "BruteForce: " << bench.bfUs << " us\n";
-    std::cout << "KD-Tree:    " << bench.kdUs << " us\n";
-    std::cout << "HNSW:       " << bench.hnswUs << " us\n";
-
+    svr.listen("0.0.0.0", 8080);
     return 0;
 }
