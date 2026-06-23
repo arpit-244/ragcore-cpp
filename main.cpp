@@ -613,62 +613,52 @@ void cors(httplib::Response& res) {
 
 }  
 
+//  TEXT CHUNKER
+
+
+std::vector<std::string> chunkText(const std::string& text,
+                                   int chunkWords = 250, int overlapWords = 30)
+{
+    std::istringstream ss(text);
+    std::vector<std::string> words;
+    std::string w;
+    while (ss >> w) words.push_back(w);
+
+    if (words.empty()) return {};
+    if ((int)words.size() <= chunkWords) return {text};
+
+    std::vector<std::string> chunks;
+    if (overlapWords >= chunkWords) overlapWords = chunkWords - 1;
+    int step = chunkWords - overlapWords;
+    for (int i = 0; i < (int)words.size(); i += step) {
+        int end = std::min(i + chunkWords, (int)words.size());
+        std::string chunk;
+        for (int j = i; j < end; j++) { if (j > i) chunk += ' '; chunk += words[j]; }
+        chunks.push_back(chunk);
+        if (end == (int)words.size()) break;
+    }
+    return chunks;
+}
+
 int main() {
-    VectorDB db(4); // Testing with 4d vectors
-    auto distFn = getDistFn("cosine");
-    httplib::Server svr;
+    std::string sample = "This is a simple test document to verify that the "
+                         "chunking logic works perfectly. We want to ensure that "
+                         "the sliding window moves forward correctly and no words "
+                         "are dropped. Overlap keeps context alive.";
 
-    // Handle CORS preflight requests for frontend compatibility
-    svr.Options(".*", [](const httplib::Request&, httplib::Response& res) { 
-        cors(res); 
-    });
+    std::cout << "=== Testing Text Chunker ===\n\n";
 
-    svr.Post("/insert", [&](const httplib::Request& req, httplib::Response& res) {
-        cors(res);
-        std::string meta, cat; 
-        std::vector<float> emb;
-        
-        if (!parseBody(req.body, meta, cat, emb) || emb.size() != db.dims) {
-            res.status = 400;
-            res.set_content("{\"error\":\"Invalid format or dimension mismatch\"}", "application/json");
-            return;
-        }
-        
-        int id = db.insert(meta, cat, emb, distFn);
-        res.set_content("{\"id\":" + std::to_string(id) + "}", "application/json");
-    });
+    // Small numbers make it easy to verify 
+    int chunkSize = 10;
+    int overlap = 3; 
 
-    svr.Post("/search", [&](const httplib::Request& req, httplib::Response& res) {
-        cors(res);
-        int k = extractInt(req.body, "k", 2);
-        std::string algo = extractStr(req.body, "algo");
-        if (algo.empty()) algo = "hnsw";
+    auto chunks = chunkText(sample, chunkSize, overlap);
 
-        // Extract the query array manually using string positions
-        size_t p = req.body.find("\"query\"");
-        p = req.body.find('[', p);
-        size_t e = req.body.find(']', p);
-        std::vector<float> q = parseVec(req.body.substr(p + 1, e - p - 1));
+    for (size_t i = 0; i < chunks.size(); i++) {
+        std::cout << "Chunk " << i + 1 << ":\n";
+        std::cout << chunks[i] << "\n\n";
+    }
 
-        auto out = db.search(q, k, "cosine", algo);
-
-        // Manually build the JSON response
-        std::string json = "{\"time_us\":" + std::to_string(out.us) + ",\"algo\":" + jS(out.algo) + ",\"hits\":[";
-        for (size_t i = 0; i < out.hits.size(); i++) {
-            if (i > 0) json += ",";
-            json += "{\"id\":" + std::to_string(out.hits[i].id) + 
-                    ",\"meta\":" + jS(out.hits[i].meta) + 
-                    ",\"cat\":" + jS(out.hits[i].cat) + 
-                    ",\"dist\":" + std::to_string(out.hits[i].dist) + "}";
-        }
-        json += "]}";
-        
-        res.set_content(json, "application/json");
-    });
-
-    std::cout << "VectorDB Server booting up...\n";
-    std::cout << "Listening on http://localhost:8080\n";
-    
-    svr.listen("0.0.0.0", 8080);
+    std::cout << "Total chunks created: " << chunks.size() << "\n";
     return 0;
 }
