@@ -640,25 +640,125 @@ std::vector<std::string> chunkText(const std::string& text,
     return chunks;
 }
 
-int main() {
-    std::string sample = "This is a simple test document to verify that the "
-                         "chunking logic works perfectly. We want to ensure that "
-                         "the sliding window moves forward correctly and no words "
-                         "are dropped. Overlap keeps context alive.";
+class OllamaClient {
+    std::string host;
+    int         port;
 
-    std::cout << "=== Testing Text Chunker ===\n\n";
-
-    // Small numbers make it easy to verify 
-    int chunkSize = 10;
-    int overlap = 3; 
-
-    auto chunks = chunkText(sample, chunkSize, overlap);
-
-    for (size_t i = 0; i < chunks.size(); i++) {
-        std::cout << "Chunk " << i + 1 << ":\n";
-        std::cout << chunks[i] << "\n\n";
+    // Escape a string for embedding inside a JSON string literal
+    std::string esc(const std::string& s) {
+        std::string o;
+        for (char c : s) {
+            if      (c == '"')  o += "\\\"";
+            else if (c == '\\') o += "\\\\";
+            else if (c == '\n') o += "\\n";
+            else if (c == '\r') o += "\\r";
+            else if (c == '\t') o += "\\t";
+            else                o += c;
+        }
+        return o;
     }
 
-    std::cout << "Total chunks created: " << chunks.size() << "\n";
+    // Parse embedding from Ollama /api/embeddings response
+    std::vector<float> parseEmbedding(const std::string& body) {
+        size_t p = body.find("\"embedding\"");
+        if (p == std::string::npos) return {};
+        p = body.find('[', p);
+        if (p == std::string::npos) return {};
+        // Find matching embeddings 
+        size_t e = p + 1, depth = 1;
+        while (e < body.size() && depth > 0) {
+            if (body[e] == '[') depth++;
+            else if (body[e] == ']') depth--;
+            e++;
+        }
+        return parseVec(body.substr(p + 1, e - p - 2));
+    }
+
+    
+    std::string parseResponse(const std::string& body) {
+        return extractStr(body, "response");
+    }
+
+public:
+    std::string embedModel = "nomic-embed-text";
+    std::string genModel   = "llama3.2";
+
+    OllamaClient(const std::string& h = "127.0.0.1", int p = 11434)
+        : host(h), port(p) {}
+
+    bool isAvailable() {
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(2, 0);
+        auto res = cli.Get("/api/tags");
+        return res && res->status == 200;
+    }
+
+    // Returns empty vector if Ollama is not running or model not found
+    std::vector<float> embed(const std::string& text) {
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(3, 0);
+        cli.set_read_timeout(30, 0);
+        std::string body = "{\"model\":\"" + embedModel + "\",\"prompt\":\"" + esc(text) + "\"}";
+        auto res = cli.Post("/api/embeddings", body, "application/json");
+        if (!res || res->status != 200) return {};
+        return parseEmbedding(res->body);
+    }
+
+    // Returns error string if Ollama is unavailable
+    std::string generate(const std::string& prompt) {
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(3, 0);
+        cli.set_read_timeout(180, 0);   // LLMs can be slow
+        std::string body = "{\"model\":\"" + genModel + "\","
+                           "\"prompt\":\"" + esc(prompt) + "\","
+                           "\"stream\":false}";
+        auto res = cli.Post("/api/generate", body, "application/json");
+        if (!res || res->status != 200)
+            return "ERROR: Ollama unavailable. Run: ollama serve";
+        return parseResponse(res->body);
+    }
+};
+
+int main() {
+    std::cout << "=== Testing Ollama Client ===\n\n";
+
+    OllamaClient ollama;
+
+    // Test Connection
+    std::cout << "[1] Checking connection to Ollama (localhost:11434)...\n";
+    if (!ollama.isAvailable()) {
+        std::cout << "CRITICAL ERROR: Ollama is not running.\n";
+        std::cout << "Please open a new terminal and type: ollama serve\n";
+        return 1;
+    }
+    std::cout << "SUCCESS: Connected to Ollama!\n\n";
+
+    // Test Embedding Model
+    std::cout << "[2] Testing Embedding Model (" << ollama.embedModel << ")...\n";
+    std::string textToEmbed = "This is a test sentence about pizza.";
+    auto embedding = ollama.embed(textToEmbed);
+    
+    if (embedding.empty()) {
+        std::cout << "ERROR: Failed to generate embedding. Did you run 'ollama pull nomic-embed-text'?\n";
+    } else {
+        std::cout << "SUCCESS: Generated embedding with " << embedding.size() << " dimensions.\n";
+        std::cout << "First 3 values: [" << embedding[0] << ", " << embedding[1] << ", " << embedding[2] << "...]\n\n";
+    }
+
+    // Test Generation Model
+    std::cout << "[3] Testing Generation Model (" << ollama.genModel << ")...\n";
+    std::string prompt = "Explain the concept of an array in one short sentence.";
+    std::cout << "Prompt: " << prompt << "\n";
+    std::string response = ollama.generate(prompt);
+    
+    if (response.find("ERROR") != std::string::npos) {
+        std::cout << response << "\n";
+    } else {
+        std::cout << "SUCCESS! Ollama replied:\n";
+        std::cout << "------------------------------------\n";
+        std::cout << response << "\n";
+        std::cout << "------------------------------------\n";
+    }
+
     return 0;
 }
