@@ -719,45 +719,114 @@ public:
     }
 };
 
+//  DOCUMENT DATABASE
+
+struct DocItem {
+    int         id;
+    std::string title;
+    std::string text;
+    std::vector<float> emb;
+};
+
+class DocumentDB {
+    std::unordered_map<int, DocItem> store;
+    HNSW       hnsw;
+    BruteForce bf;       
+    std::mutex mu;
+    int nextId = 1;
+    int dims   = 0;      
+public:
+    DocumentDB() : hnsw(16, 200) {}
+
+    
+    int insert(const std::string& title, const std::string& text,
+               const std::vector<float>& emb)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (dims == 0) dims = (int)emb.size();
+        DocItem item{nextId++, title, text, emb};
+        store[item.id] = item;
+        VectorItem vi{item.id, title, "doc", emb};
+        hnsw.insert(vi, cosine);
+        bf.insert(vi);
+        return item.id;
+    }
+
+    // Semantic search returns top-k most similar chunks
+    std::vector<std::pair<float, DocItem>> search(
+        const std::vector<float>& q, int k, float max_dist = 0.7f)
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        if (store.empty()) return {};
+        auto raw = (store.size() < 10)
+                   ? bf.knn(q, k, cosine)
+                   : hnsw.knn(q, k, 50, cosine);
+        std::vector<std::pair<float, DocItem>> out;
+        for (auto& [d, id] : raw)
+            if (store.count(id) && d <= max_dist) out.push_back({d, store[id]});
+        return out;
+    }
+
+    bool remove(int id) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!store.count(id)) return false;
+        store.erase(id); hnsw.remove(id); bf.remove(id);
+        return true;
+    }
+
+    std::vector<DocItem> all() {
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<DocItem> r;
+        for (auto& [id, v] : store) r.push_back(v);
+        return r;
+    }
+
+    size_t size() {
+        std::lock_guard<std::mutex> lk(mu);
+        return store.size();
+    }
+
+    int getDims() { return dims; }
+};
+
 int main() {
-    std::cout << "=== Testing Ollama Client ===\n\n";
+    std::cout << "=== Testing Document Database ===\n\n";
 
-    OllamaClient ollama;
+    DocumentDB db;
 
-    // Test Connection
-    std::cout << "[1] Checking connection to Ollama (localhost:11434)...\n";
-    if (!ollama.isAvailable()) {
-        std::cout << "CRITICAL ERROR: Ollama is not running.\n";
-        std::cout << "Please open a new terminal and type: ollama serve\n";
-        return 1;
-    }
-    std::cout << "SUCCESS: Connected to Ollama!\n\n";
+    // 1 dummy embeddings (3 dimensions for easy math)
+    // emb1 and emb2 are very similar to each other. emb3 is completely different.
+    std::vector<float> emb1 = {1.0f, 0.1f, 0.0f}; 
+    std::vector<float> emb2 = {0.9f, 0.2f, 0.0f}; 
+    std::vector<float> emb3 = {0.0f, 0.0f, 1.0f}; 
 
-    // Test Embedding Model
-    std::cout << "[2] Testing Embedding Model (" << ollama.embedModel << ")...\n";
-    std::string textToEmbed = "This is a test sentence about pizza.";
-    auto embedding = ollama.embed(textToEmbed);
+    // 2Insert into DB
+    std::cout << "[1] Inserting documents...\n";
+    db.insert("Fruit 1", "Apples are delicious.", emb1);
+    db.insert("Fruit 2", "Bananas are yellow.", emb2);
+    db.insert("Vehicle", "Cars drive on roads.", emb3);
+
+    std::cout << "SUCCESS: Database size is now " << db.size() << ".\n";
+    std::cout << "SUCCESS: Auto-detected dimensions: " << db.getDims() << ".\n\n";
+
+    // 3 Search the DB
+    std::cout << "[2] Searching for a vector close to {1.0, 0.0, 0.0}...\n";
     
-    if (embedding.empty()) {
-        std::cout << "ERROR: Failed to generate embedding. Did you run 'ollama pull nomic-embed-text'?\n";
-    } else {
-        std::cout << "SUCCESS: Generated embedding with " << embedding.size() << " dimensions.\n";
-        std::cout << "First 3 values: [" << embedding[0] << ", " << embedding[1] << ", " << embedding[2] << "...]\n\n";
-    }
-
-    // Test Generation Model
-    std::cout << "[3] Testing Generation Model (" << ollama.genModel << ")...\n";
-    std::string prompt = "Explain the concept of an array in one short sentence.";
-    std::cout << "Prompt: " << prompt << "\n";
-    std::string response = ollama.generate(prompt);
+    std::vector<float> query = {1.0f, 0.0f, 0.0f};
     
-    if (response.find("ERROR") != std::string::npos) {
-        std::cout << response << "\n";
+    // Search for top 2 closest matches
+    auto results = db.search(query, 2);
+
+    std::cout << "\n--- Search Results ---\n";
+    if (results.empty()) {
+        std::cout << "No results found within max_dist.\n";
     } else {
-        std::cout << "SUCCESS! Ollama replied:\n";
-        std::cout << "------------------------------------\n";
-        std::cout << response << "\n";
-        std::cout << "------------------------------------\n";
+        for (size_t i = 0; i < results.size(); i++) {
+            std::cout << "Rank " << i + 1 << ":\n";
+            std::cout << "Distance: " << results[i].first << "\n";
+            std::cout << "Title:    " << results[i].second.title << "\n";
+            std::cout << "Text:     " << results[i].second.text << "\n\n";
+        }
     }
 
     return 0;
