@@ -430,6 +430,23 @@ public:
             (int)store.size()
         };
     }
+        std::vector<VectorItem> all() {
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<VectorItem> r;
+        for (auto& [id, v] : store) r.push_back(v);
+        return r;
+    }
+
+    HNSW::GraphInfo hnswInfo() {
+        std::lock_guard<std::mutex> lk(mu);
+        return hnsw.getInfo();
+    }
+
+    size_t size() {
+        std::lock_guard<std::mutex> lk(mu);
+        return store.size();
+    }
+
 };
 
 //  JSON HELPERS
@@ -789,45 +806,186 @@ public:
     int getDims() { return dims; }
 };
 
+// demo data 
+void loadDemo(VectorDB& db) {
+    auto dist = getDistFn("cosine");
+    // Dims 0-3: CS | Dims 4-7: Math | Dims 8-11: Food | Dims 12-15: Sports
+    db.insert("Linked List: nodes connected by pointers", "cs",
+        {0.90f,0.85f,0.72f,0.68f,0.12f,0.08f,0.15f,0.10f,0.05f,0.08f,0.06f,0.09f,0.07f,0.11f,0.08f,0.06f}, dist);
+    db.insert("Binary Search Tree: O(log n) search and insert", "cs",
+        {0.88f,0.82f,0.78f,0.74f,0.15f,0.10f,0.08f,0.12f,0.06f,0.07f,0.08f,0.05f,0.09f,0.06f,0.07f,0.10f}, dist);
+    db.insert("Dynamic Programming: memoization overlapping subproblems", "cs",
+        {0.82f,0.76f,0.88f,0.80f,0.20f,0.18f,0.12f,0.09f,0.07f,0.06f,0.08f,0.07f,0.08f,0.09f,0.06f,0.07f}, dist);
+    db.insert("Graph BFS and DFS: breadth and depth first traversal", "cs",
+        {0.85f,0.80f,0.75f,0.82f,0.18f,0.14f,0.10f,0.08f,0.06f,0.09f,0.07f,0.06f,0.10f,0.08f,0.09f,0.07f}, dist);
+    db.insert("Hash Table: O(1) lookup with collision chaining", "cs",
+        {0.87f,0.78f,0.70f,0.76f,0.13f,0.11f,0.09f,0.14f,0.08f,0.07f,0.06f,0.08f,0.07f,0.10f,0.08f,0.09f}, dist);
+    db.insert("Calculus: derivatives integrals and limits", "math",
+        {0.12f,0.15f,0.18f,0.10f,0.91f,0.86f,0.78f,0.72f,0.08f,0.06f,0.07f,0.09f,0.07f,0.08f,0.06f,0.10f}, dist);
+    db.insert("Linear Algebra: matrices eigenvalues eigenvectors", "math",
+        {0.20f,0.18f,0.15f,0.12f,0.88f,0.90f,0.82f,0.76f,0.09f,0.07f,0.08f,0.06f,0.10f,0.07f,0.08f,0.09f}, dist);
+    db.insert("Probability: distributions random variables Bayes theorem", "math",
+        {0.15f,0.12f,0.20f,0.18f,0.84f,0.80f,0.88f,0.82f,0.07f,0.08f,0.06f,0.10f,0.09f,0.06f,0.09f,0.08f}, dist);
+    db.insert("Number Theory: primes modular arithmetic RSA cryptography", "math",
+        {0.22f,0.16f,0.14f,0.20f,0.80f,0.85f,0.76f,0.90f,0.08f,0.09f,0.07f,0.06f,0.08f,0.10f,0.07f,0.06f}, dist);
+    db.insert("Combinatorics: permutations combinations generating functions", "math",
+        {0.18f,0.20f,0.16f,0.14f,0.86f,0.78f,0.84f,0.80f,0.06f,0.07f,0.09f,0.08f,0.06f,0.09f,0.10f,0.07f}, dist);
+    db.insert("Neapolitan Pizza: wood-fired dough San Marzano tomatoes", "food",
+        {0.08f,0.06f,0.09f,0.07f,0.07f,0.08f,0.06f,0.09f,0.90f,0.86f,0.78f,0.72f,0.08f,0.06f,0.09f,0.07f}, dist);
+    db.insert("Sushi: vinegared rice raw fish and nori rolls", "food",
+        {0.06f,0.08f,0.07f,0.09f,0.09f,0.06f,0.08f,0.07f,0.86f,0.90f,0.82f,0.76f,0.07f,0.09f,0.06f,0.08f}, dist);
+    db.insert("Ramen: noodle soup with chashu pork and soft-boiled eggs", "food",
+        {0.09f,0.07f,0.06f,0.08f,0.08f,0.09f,0.07f,0.06f,0.82f,0.78f,0.90f,0.84f,0.09f,0.07f,0.08f,0.06f}, dist);
+    db.insert("Tacos: corn tortillas with carnitas salsa and cilantro", "food",
+        {0.07f,0.09f,0.08f,0.06f,0.06f,0.07f,0.09f,0.08f,0.78f,0.82f,0.86f,0.90f,0.06f,0.08f,0.07f,0.09f}, dist);
+    db.insert("Croissant: laminated pastry with buttery flaky layers", "food",
+        {0.06f,0.07f,0.10f,0.09f,0.10f,0.06f,0.07f,0.10f,0.85f,0.80f,0.76f,0.82f,0.09f,0.07f,0.10f,0.06f}, dist);
+    db.insert("Basketball: fast-paced shooting dribbling slam dunks", "sports",
+        {0.09f,0.07f,0.08f,0.10f,0.08f,0.09f,0.07f,0.06f,0.08f,0.07f,0.09f,0.06f,0.91f,0.85f,0.78f,0.72f}, dist);
+    db.insert("Football: tackles touchdowns field goals and strategy", "sports",
+        {0.07f,0.09f,0.06f,0.08f,0.09f,0.07f,0.10f,0.08f,0.07f,0.09f,0.08f,0.07f,0.87f,0.89f,0.82f,0.76f}, dist);
+    db.insert("Tennis: racket volleys groundstrokes and Wimbledon serves", "sports",
+        {0.08f,0.06f,0.09f,0.07f,0.07f,0.08f,0.06f,0.09f,0.09f,0.06f,0.07f,0.08f,0.83f,0.80f,0.88f,0.82f}, dist);
+    db.insert("Chess: openings endgames tactics strategic board game", "sports",
+        {0.25f,0.20f,0.22f,0.18f,0.22f,0.18f,0.20f,0.15f,0.06f,0.08f,0.07f,0.09f,0.80f,0.84f,0.78f,0.90f}, dist);
+    db.insert("Swimming: butterfly freestyle backstroke Olympic competition", "sports",
+        {0.06f,0.08f,0.07f,0.09f,0.08f,0.06f,0.09f,0.07f,0.10f,0.08f,0.06f,0.07f,0.85f,0.82f,0.86f,0.80f}, dist);
+}
+
 int main() {
-    std::cout << "=== Testing Document Database ===\n\n";
+    VectorDB   db(DIMS);
+    DocumentDB docDB;
+    OllamaClient ollama;
 
-    DocumentDB db;
+    loadDemo(db);
 
-    // 1 dummy embeddings (3 dimensions for easy math)
-    // emb1 and emb2 are very similar to each other. emb3 is completely different.
-    std::vector<float> emb1 = {1.0f, 0.1f, 0.0f}; 
-    std::vector<float> emb2 = {0.9f, 0.2f, 0.0f}; 
-    std::vector<float> emb3 = {0.0f, 0.0f, 1.0f}; 
-
-    // 2Insert into DB
-    std::cout << "[1] Inserting documents...\n";
-    db.insert("Fruit 1", "Apples are delicious.", emb1);
-    db.insert("Fruit 2", "Bananas are yellow.", emb2);
-    db.insert("Vehicle", "Cars drive on roads.", emb3);
-
-    std::cout << "SUCCESS: Database size is now " << db.size() << ".\n";
-    std::cout << "SUCCESS: Auto-detected dimensions: " << db.getDims() << ".\n\n";
-
-    // 3 Search the DB
-    std::cout << "[2] Searching for a vector close to {1.0, 0.0, 0.0}...\n";
     
-    std::vector<float> query = {1.0f, 0.0f, 0.0f};
-    
-    // Search for top 2 closest matches
-    auto results = db.search(query, 2);
+    bool ollamaUp = ollama.isAvailable();
+    std::cout << "=== VectorDB Engine ===" << std::endl;
+    std::cout << "http://localhost:8080" << std::endl;
+    std::cout << db.size() << " demo vectors | " << DIMS << " dims | HNSW+KD-Tree+BruteForce" << std::endl;
+    std::cout << "Ollama: " << (ollamaUp ? "ONLINE" : "OFFLINE (install from ollama.com)") << std::endl;
+    if (ollamaUp) std::cout << "  embed model: " << ollama.embedModel
+                            << "  gen model: "   << ollama.genModel << std::endl;
 
-    std::cout << "\n--- Search Results ---\n";
-    if (results.empty()) {
-        std::cout << "No results found within max_dist.\n";
-    } else {
-        for (size_t i = 0; i < results.size(); i++) {
-            std::cout << "Rank " << i + 1 << ":\n";
-            std::cout << "Distance: " << results[i].first << "\n";
-            std::cout << "Title:    " << results[i].second.title << "\n";
-            std::cout << "Text:     " << results[i].second.text << "\n\n";
+    httplib::Server svr;
+
+    // CORS 
+    svr.Options(".*", [](const httplib::Request&, httplib::Response& res) {
+        cors(res); res.status = 204;
+    });
+
+    
+
+    svr.Get("/search", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        auto q = parseVec(req.get_param_value("v"));
+        if ((int)q.size() != DIMS) {
+            res.set_content("{\"error\":\"need " + std::to_string(DIMS) + "D vector\"}",
+                            "application/json"); return;
         }
-    }
+        int k = 5;
+        try { k = std::stoi(req.get_param_value("k")); } catch (...) {}
+        auto metric = req.get_param_value("metric"); if (metric.empty()) metric = "cosine";
+        auto algo   = req.get_param_value("algo");   if (algo.empty())   algo   = "hnsw";
 
-    return 0;
+        auto out = db.search(q, k, metric, algo);
+        std::ostringstream ss;
+        ss << "{\"results\":[";
+        for (size_t i = 0; i < out.hits.size(); i++) {
+            if (i) ss << ',';
+            auto& h = out.hits[i];
+            ss << "{\"id\":"        << h.id
+               << ",\"metadata\":"  << jS(h.meta)
+               << ",\"category\":"  << jS(h.cat)
+               << ",\"distance\":"  << std::fixed << std::setprecision(6) << h.dist
+               << ",\"embedding\":" << jVec(h.emb) << '}';
+        }
+        ss << "],\"latencyUs\":" << out.us
+           << ",\"algo\":"       << jS(out.algo)
+           << ",\"metric\":"     << jS(out.metric) << '}';
+        res.set_content(ss.str(), "application/json");
+    });
+
+    svr.Post("/insert", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        std::string meta, cat; std::vector<float> emb;
+        if (!parseBody(req.body, meta, cat, emb) || (int)emb.size() != DIMS) {
+            res.set_content("{\"error\":\"invalid body\"}", "application/json"); return;
+        }
+        int id = db.insert(meta, cat, emb, getDistFn("cosine"));
+        res.set_content("{\"id\":" + std::to_string(id) + "}", "application/json");
+    });
+
+    svr.Delete(R"(/delete/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        int id  = std::stoi(req.matches[1]);
+        bool ok = db.remove(id);
+        res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
+                        "application/json");
+    });
+
+    svr.Get("/items", [&](const httplib::Request&, httplib::Response& res) {
+        cors(res);
+        auto items = db.all();
+        std::ostringstream ss; ss << '[';
+        for (size_t i = 0; i < items.size(); i++) {
+            if (i) ss << ',';
+            auto& v = items[i];
+            ss << "{\"id\":"        << v.id
+               << ",\"metadata\":"  << jS(v.metadata)
+               << ",\"category\":"  << jS(v.category)
+               << ",\"embedding\":" << jVec(v.emb) << '}';
+        }
+        ss << ']';
+        res.set_content(ss.str(), "application/json");
+    });
+
+    svr.Get("/benchmark", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        auto q = parseVec(req.get_param_value("v"));
+        if ((int)q.size() != DIMS) {
+            res.set_content("{\"error\":\"need " + std::to_string(DIMS) + "D vector\"}",
+                            "application/json"); return;
+        }
+        int k = 5; try { k = std::stoi(req.get_param_value("k")); } catch (...) {}
+        auto metric = req.get_param_value("metric"); if (metric.empty()) metric = "cosine";
+        auto b = db.benchmark(q, k, metric);
+        std::ostringstream ss;
+        ss << "{\"bruteforceUs\":" << b.bfUs << ",\"kdtreeUs\":" << b.kdUs
+           << ",\"hnswUs\":"       << b.hnswUs << ",\"itemCount\":" << b.n << '}';
+        res.set_content(ss.str(), "application/json");
+    });
+
+    svr.Get("/hnsw-info", [&](const httplib::Request&, httplib::Response& res) {
+        cors(res);
+        auto gi = db.hnswInfo();
+        std::ostringstream ss;
+        ss << "{\"topLayer\":" << gi.topLayer << ",\"nodeCount\":" << gi.nodeCount
+           << ",\"nodesPerLayer\":[";
+        for (size_t i = 0; i < gi.nodesPerLayer.size(); i++) {
+            if (i) ss << ','; ss << gi.nodesPerLayer[i];
+        }
+        ss << "],\"edgesPerLayer\":[";
+        for (size_t i = 0; i < gi.edgesPerLayer.size(); i++) {
+            if (i) ss << ','; ss << gi.edgesPerLayer[i];
+        }
+        ss << "],\"nodes\":[";
+        for (size_t i = 0; i < gi.nodes.size(); i++) {
+            if (i) ss << ',';
+            auto& n = gi.nodes[i];
+            ss << "{\"id\":" << n.id << ",\"metadata\":" << jS(n.metadata)
+               << ",\"category\":" << jS(n.category) << ",\"maxLyr\":" << n.maxLyr << '}';
+        }
+        ss << "],\"edges\":[";
+        for (size_t i = 0; i < gi.edges.size(); i++) {
+            if (i) ss << ',';
+            auto& e = gi.edges[i];
+            ss << "{\"src\":" << e.src << ",\"dst\":" << e.dst << ",\"lyr\":" << e.lyr << '}';
+        }
+        ss << "]}";
+        res.set_content(ss.str(), "application/json");
+    });
+
+
 }
